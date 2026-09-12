@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Cursor;
 use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
@@ -28,6 +29,7 @@ use flate2::read::GzDecoder;
 use opendal_core::raw::*;
 use opendal_core::*;
 use serde::Deserialize;
+use sha2::Digest;
 use tar::Archive;
 
 use super::CONTAINER_SCHEME;
@@ -202,15 +204,15 @@ impl Service for ContainerBackend {
 
     fn list(&self, _: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
         let p = build_abs_path(&self.root, path);
-        let scan_path = if p.is_empty() || p.ends_with('/') {
-            p
+        let (scan_path, resolved_path) = if !p.is_empty() && path.ends_with('/') {
+            let resolved = self
+                .resolve_path(p.trim_end_matches('/'))?
+                .map(|path| ensure_dir_path(&path))
+                .unwrap_or_else(|| p.clone());
+            (p, resolved)
         } else {
-            format!("{p}/")
+            (p.clone(), p)
         };
-        let resolved_path = self
-            .resolve_path(scan_path.trim_end_matches('/'))?
-            .map(|path| ensure_dir_path(&path))
-            .unwrap_or_else(|| scan_path.clone());
         let entries = self
             .core
             .scan(&resolved_path)
@@ -318,6 +320,7 @@ struct Descriptor {
     #[serde(rename = "mediaType")]
     media_type: String,
     digest: String,
+    size: u64,
     #[serde(default)]
     annotations: HashMap<String, String>,
     #[serde(default)]
@@ -380,10 +383,9 @@ fn resolve_manifest(
 
     match descriptor.media_type.as_str() {
         OCI_IMAGE_MANIFEST | DOCKER_MANIFEST => {
-            let manifest: OciManifest = read_json(&blob_path(layout, &descriptor.digest)?)?;
+            let manifest: OciManifest = read_descriptor_json(layout, descriptor)?;
+            let config: OciImageConfig = read_descriptor_json(layout, &manifest.config)?;
             if descriptor.platform.is_none() {
-                let config: OciImageConfig =
-                    read_json(&blob_path(layout, &manifest.config.digest)?)?;
                 let config_platform = OciPlatform {
                     architecture: config.architecture,
                     os: config.os,
@@ -396,7 +398,7 @@ fn resolve_manifest(
             Ok(Some(manifest))
         }
         OCI_IMAGE_INDEX | DOCKER_MANIFEST_LIST => {
-            let index: OciIndex = read_json(&blob_path(layout, &descriptor.digest)?)?;
+            let index: OciIndex = read_descriptor_json(layout, descriptor)?;
             for descriptor in &index.manifests {
                 if let Some(manifest) = resolve_manifest(layout, descriptor, platform)? {
                     return Ok(Some(manifest));
@@ -404,11 +406,7 @@ fn resolve_manifest(
             }
             Ok(None)
         }
-        _ => Err(Error::new(
-            ErrorKind::Unsupported,
-            "unsupported OCI descriptor media type",
-        )
-        .with_context("media_type", descriptor.media_type.clone())),
+        _ => Ok(None),
     }
 }
 
@@ -417,17 +415,12 @@ fn apply_layer(
     descriptor: &Descriptor,
     entries: &mut BTreeMap<String, ContainerEntry>,
 ) -> Result<()> {
-    let path = blob_path(layout, &descriptor.digest)?;
-    let file = File::open(&path).map_err(|err| {
-        Error::new(ErrorKind::Unexpected, "failed to open OCI layer blob")
-            .with_context("path", path.display().to_string())
-            .set_source(err)
-    })?;
+    let content = read_blob(layout, descriptor)?;
 
     match descriptor.media_type.as_str() {
-        OCI_LAYER_TAR => apply_tar_layer(Archive::new(file), entries),
+        OCI_LAYER_TAR => apply_tar_layer(Archive::new(Cursor::new(content)), entries),
         OCI_LAYER_TAR_GZIP | DOCKER_LAYER_TAR_GZIP => {
-            apply_tar_layer(Archive::new(GzDecoder::new(file)), entries)
+            apply_tar_layer(Archive::new(GzDecoder::new(Cursor::new(content))), entries)
         }
         _ => Err(
             Error::new(ErrorKind::Unsupported, "unsupported OCI layer media type")
@@ -733,6 +726,58 @@ fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<T> {
     })
 }
 
+fn read_descriptor_json<T: for<'de> Deserialize<'de>>(
+    layout: &Path,
+    descriptor: &Descriptor,
+) -> Result<T> {
+    let content = read_blob(layout, descriptor)?;
+    serde_json::from_slice(&content).map_err(|err| {
+        Error::new(ErrorKind::Unexpected, "failed to decode OCI json blob")
+            .with_context("digest", descriptor.digest.clone())
+            .set_source(err)
+    })
+}
+
+fn read_blob(layout: &Path, descriptor: &Descriptor) -> Result<Vec<u8>> {
+    let path = blob_path(layout, &descriptor.digest)?;
+    let content = std::fs::read(&path).map_err(|err| {
+        Error::new(ErrorKind::Unexpected, "failed to read OCI blob")
+            .with_context("path", path.display().to_string())
+            .set_source(err)
+    })?;
+
+    if content.len() as u64 != descriptor.size {
+        return Err(Error::new(
+            ErrorKind::ConfigInvalid,
+            "OCI blob size does not match descriptor",
+        )
+        .with_context("digest", descriptor.digest.clone())
+        .with_context("expected", descriptor.size.to_string())
+        .with_context("actual", content.len().to_string()));
+    }
+
+    let actual = sha2::Sha256::digest(&content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let expected = descriptor.digest.strip_prefix("sha256:").ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unsupported,
+            "unsupported OCI descriptor digest algorithm",
+        )
+        .with_context("digest", descriptor.digest.clone())
+    })?;
+    if actual != expected {
+        return Err(Error::new(
+            ErrorKind::ConfigInvalid,
+            "OCI blob digest does not match descriptor",
+        )
+        .with_context("digest", descriptor.digest.clone()));
+    }
+
+    Ok(content)
+}
+
 fn blob_path(layout: &Path, digest: &str) -> Result<PathBuf> {
     let (algorithm, encoded) = digest.split_once(':').ok_or_else(|| {
         Error::new(ErrorKind::ConfigInvalid, "invalid OCI descriptor digest")
@@ -791,8 +836,10 @@ mod tests {
         assert_eq!(bs.to_vec(), b"NAME=OpenDAL\n");
 
         let entries = op.list("etc/").await?;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path(), "etc/os-release");
+        assert_eq!(
+            entries.iter().map(|entry| entry.path()).collect::<Vec<_>>(),
+            ["etc/", "etc/os-release"]
+        );
 
         Ok(())
     }
@@ -844,7 +891,7 @@ mod tests {
 
         let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
         assert!(op.stat("dir").await?.is_dir());
-        assert!(op.list("dir/").await?.is_empty());
+        assert_eq!(op.list("dir/").await?[0].path(), "dir/");
         Ok(())
     }
 
@@ -898,8 +945,49 @@ mod tests {
 
         let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
         let entries = op.list("bin/").await?;
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].path(), "bin/tool");
+        assert_eq!(
+            entries.iter().map(|entry| entry.path()).collect::<Vec<_>>(),
+            ["bin/", "bin/tool"]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_preserves_prefix_semantics() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let layer = gzip_layer(&[
+            TestEntry::file("foo", b"foo"),
+            TestEntry::file("foobar", b"foobar"),
+            TestEntry::dir("empty/"),
+            TestEntry::file("dir/child", b"child"),
+        ]);
+        write_layout(dir.path(), vec![layer]);
+
+        let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
+        assert_eq!(
+            op.list("foo")
+                .await?
+                .iter()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>(),
+            ["foo", "foobar"]
+        );
+        assert_eq!(
+            op.list("empty/")
+                .await?
+                .iter()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>(),
+            ["empty/"]
+        );
+        assert_eq!(
+            op.list("dir/")
+                .await?
+                .iter()
+                .map(|entry| entry.path())
+                .collect::<Vec<_>>(),
+            ["dir/", "dir/child"]
+        );
         Ok(())
     }
 
@@ -919,6 +1007,47 @@ mod tests {
         let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
         assert_eq!(op.read("platform").await?.to_vec(), b"amd64");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn unknown_descriptors_do_not_stop_manifest_search() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        create_layout(dir.path());
+        let mut index = read_json_value(&dir.path().join("index.json"));
+        let manifest = index["manifests"][0].clone();
+        index["manifests"] =
+            serde_json::json!([unknown_descriptor(Some("latest")), manifest.clone()]);
+        write_json_value(&dir.path().join("index.json"), &index);
+        assert!(operator(dir.path(), "latest", ImagePlatform::linux_amd64()).is_ok());
+
+        let nested = serde_json::json!({
+            "schemaVersion": 2,
+            "manifests": [unknown_descriptor(None), manifest],
+        });
+        let nested_bytes = serde_json::to_vec(&nested).unwrap();
+        let nested_digest = write_blob(dir.path(), &nested_bytes);
+        index["manifests"] = serde_json::json!([{
+            "mediaType": OCI_IMAGE_INDEX,
+            "digest": nested_digest,
+            "size": nested_bytes.len(),
+            "annotations": {(OCI_REF_NAME): "latest"},
+        }]);
+        write_json_value(&dir.path().join("index.json"), &index);
+        assert!(operator(dir.path(), "latest", ImagePlatform::linux_amd64()).is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn descriptor_content_and_size_are_verified() {
+        for target in ["manifest", "config", "layer", "size"] {
+            let dir = tempfile::tempdir().unwrap();
+            create_layout(dir.path());
+            tamper_layout(dir.path(), target);
+            assert!(
+                operator(dir.path(), "latest", ImagePlatform::linux_amd64()).is_err(),
+                "tampered {target} should be rejected"
+            );
+        }
     }
 
     fn operator(path: &Path, reference: &str, platform: ImagePlatform) -> Result<Operator> {
@@ -1026,6 +1155,7 @@ mod tests {
 
     enum TestEntry<'a> {
         File(&'a str, &'a [u8]),
+        Dir(&'a str),
         Symlink(&'a str, &'a str),
         Hardlink(&'a str, &'a str),
     }
@@ -1033,6 +1163,10 @@ mod tests {
     impl<'a> TestEntry<'a> {
         fn file(path: &'a str, content: &'a [u8]) -> Self {
             Self::File(path, content)
+        }
+
+        fn dir(path: &'a str) -> Self {
+            Self::Dir(path)
         }
 
         fn symlink(path: &'a str, target: &'a str) -> Self {
@@ -1052,6 +1186,10 @@ mod tests {
                 let mut header = Header::new_gnu();
                 let (path, content) = match entry {
                     TestEntry::File(path, content) => (*path, *content),
+                    TestEntry::Dir(path) => {
+                        header.set_entry_type(tar::EntryType::Directory);
+                        (*path, b"".as_slice())
+                    }
                     TestEntry::Symlink(path, target) => {
                         header.set_entry_type(tar::EntryType::Symlink);
                         header.set_link_name(target).unwrap();
@@ -1084,5 +1222,67 @@ mod tests {
             .collect::<String>();
         fs::write(path.join("blobs/sha256").join(&encoded), content).unwrap();
         format!("sha256:{encoded}")
+    }
+
+    fn unknown_descriptor(reference: Option<&str>) -> serde_json::Value {
+        let mut descriptor = serde_json::json!({
+            "mediaType": "application/vnd.example.unknown",
+            "digest": format!("sha256:{}", "0".repeat(64)),
+            "size": 0,
+        });
+        if let Some(reference) = reference {
+            descriptor["annotations"] = serde_json::json!({(OCI_REF_NAME): reference});
+        }
+        descriptor
+    }
+
+    fn read_json_value(path: &Path) -> serde_json::Value {
+        serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
+    }
+
+    fn write_json_value(path: &Path, value: &serde_json::Value) {
+        fs::write(path, serde_json::to_vec(value).unwrap()).unwrap();
+    }
+
+    fn descriptor_blob_path(layout: &Path, descriptor: &serde_json::Value) -> PathBuf {
+        blob_path(layout, descriptor["digest"].as_str().unwrap()).unwrap()
+    }
+
+    fn tamper_layout(layout: &Path, target: &str) {
+        let mut index = read_json_value(&layout.join("index.json"));
+        let manifest_descriptor = &mut index["manifests"][0];
+        if target == "size" {
+            manifest_descriptor["size"] =
+                serde_json::json!(manifest_descriptor["size"].as_u64().unwrap() + 1);
+            write_json_value(&layout.join("index.json"), &index);
+            return;
+        }
+
+        let manifest_path = descriptor_blob_path(layout, manifest_descriptor);
+        if target == "manifest" {
+            let mut manifest = read_json_value(&manifest_path);
+            manifest["schemaVersion"] = serde_json::json!(3);
+            write_json_value(&manifest_path, &manifest);
+            return;
+        }
+
+        let manifest = read_json_value(&manifest_path);
+        let descriptor = if target == "config" {
+            &manifest["config"]
+        } else {
+            &manifest["layers"][0]
+        };
+        let path = descriptor_blob_path(layout, descriptor);
+        if target == "config" {
+            let mut config = fs::read(&path).unwrap();
+            config.extend_from_slice(b" ");
+            fs::write(path, config).unwrap();
+        } else {
+            fs::write(
+                path,
+                gzip_layer(&[TestEntry::file("etc/os-release", b"tampered")]),
+            )
+            .unwrap();
+        }
     }
 }

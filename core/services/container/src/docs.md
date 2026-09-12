@@ -20,8 +20,9 @@ operator.
 
 The service supports uncompressed tar and gzip-compressed tar layers. It
 applies OCI whiteouts and filesystem replacement rules while merging layers,
-and resolves symbolic and hard links within the image rootfs for `stat` and
-`read` operations.
+and resolves symbolic and hard links within the image rootfs for `stat`, `read`,
+and explicit directory listing operations. Descriptor sizes and SHA-256 digests
+are verified before manifest, config, or layer content is processed.
 
 The initial implementation builds an in-memory index from layer tar archives
 while the operator is being created. Remote registries, Docker daemon storage,

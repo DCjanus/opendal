@@ -46,7 +46,7 @@ impl ContainerCore {
     pub(crate) fn scan(&self, path: &str) -> Vec<(String, Metadata)> {
         self.entries
             .iter()
-            .filter(|(key, _)| key.starts_with(path) && key.as_str() != path)
+            .filter(|(key, _)| key.starts_with(path))
             .map(|(key, value)| (key.clone(), value.metadata.clone()))
             .collect()
     }
