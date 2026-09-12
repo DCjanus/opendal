@@ -3112,6 +3112,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
 
 [[package]]
+name = "filetime"
+version = "0.2.29"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5c287a33c7f0a620c38e641e7f60827713987b3c0f26e8ddc9462cc69cf75759"
+dependencies = [
+ "cfg-if 1.0.4",
+ "libc",
+]
+
+[[package]]
 name = "find-msvc-tools"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6242,6 +6252,7 @@ dependencies = [
  "opendal-service-cacache",
  "opendal-service-cloudflare-kv",
  "opendal-service-compfs",
+ "opendal-service-container",
  "opendal-service-cos",
  "opendal-service-d1",
  "opendal-service-dashmap",
@@ -6812,6 +6823,21 @@ dependencies = [
  "opendal-core",
  "rand 0.10.1",
  "serde",
+]
+
+[[package]]
+name = "opendal-service-container"
+version = "0.59.1"
+dependencies = [
+ "bytes",
+ "flate2",
+ "opendal-core",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tar",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
@@ -11054,6 +11080,17 @@ name = "tap"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "55937e1799185b12863d447f42597ed69d9928686b8d88a1df17376a097d8369"
+
+[[package]]
+name = "tar"
+version = "0.4.46"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
+]
 
 [[package]]
 name = "task-local"

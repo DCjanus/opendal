@@ -157,6 +157,7 @@ services-b2 = ["dep:opendal-service-b2"]
 services-cacache = ["dep:opendal-service-cacache"]
 services-cloudflare-kv = ["dep:opendal-service-cloudflare-kv"]
 services-compfs = ["dep:opendal-service-compfs"]
+services-container = ["dep:opendal-service-container"]
 services-cos = ["dep:opendal-service-cos"]
 services-d1 = ["dep:opendal-service-d1"]
 services-dashmap = ["dep:opendal-service-dashmap"]
@@ -281,6 +282,7 @@ opendal-service-b2 = { path = "services/b2", version = "0.59.1", optional = true
 opendal-service-cacache = { path = "services/cacache", version = "0.59.1", optional = true, default-features = false }
 opendal-service-cloudflare-kv = { path = "services/cloudflare-kv", version = "0.59.1", optional = true, default-features = false }
 opendal-service-compfs = { path = "services/compfs", version = "0.59.1", optional = true, default-features = false }
+opendal-service-container = { path = "services/container", version = "0.59.1", optional = true, default-features = false }
 opendal-service-cos = { path = "services/cos", version = "0.59.1", optional = true, default-features = false }
 opendal-service-d1 = { path = "services/d1", version = "0.59.1", optional = true, default-features = false }
 opendal-service-dashmap = { path = "services/dashmap", version = "0.59.1", optional = true, default-features = false }

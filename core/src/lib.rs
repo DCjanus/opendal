@@ -96,6 +96,9 @@ fn init_default_registry_inner(registry: &OperatorRegistry) {
     #[cfg(feature = "services-compfs")]
     opendal_service_compfs::register_compfs_service(registry);
 
+    #[cfg(feature = "services-container")]
+    opendal_service_container::register_container_service(registry);
+
     #[cfg(feature = "services-cos")]
     opendal_service_cos::register_cos_service(registry);
 
@@ -300,6 +303,8 @@ pub mod services {
     pub use opendal_service_cloudflare_kv::*;
     #[cfg(feature = "services-compfs")]
     pub use opendal_service_compfs::*;
+    #[cfg(feature = "services-container")]
+    pub use opendal_service_container::*;
     #[cfg(feature = "services-cos")]
     pub use opendal_service_cos::*;
     #[cfg(feature = "services-d1")]
