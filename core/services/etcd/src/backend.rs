@@ -27,7 +27,8 @@ use super::config::EtcdConfig;
 use super::core::EtcdCore;
 use super::core::constants::DEFAULT_ETCD_ENDPOINTS;
 use super::deleter::EtcdDeleter;
-use super::lister::EtcdLister;
+use super::lister::EtcdLazyLister;
+use super::reader::*;
 use super::writer::EtcdWriter;
 use opendal_core::raw::*;
 use opendal_core::*;
@@ -117,7 +118,7 @@ impl EtcdBuilder {
 impl Builder for EtcdBuilder {
     type Config = EtcdConfig;
 
-    fn build(self) -> Result<impl Access> {
+    fn build(self) -> Result<impl Service> {
         let endpoints = self
             .config
             .endpoints
@@ -171,17 +172,15 @@ impl EtcdBuilder {
 
 #[derive(Debug, Clone)]
 pub struct EtcdBackend {
-    core: Arc<EtcdCore>,
-    info: Arc<AccessorInfo>,
+    pub(crate) core: Arc<EtcdCore>,
+    pub(crate) info: ServiceInfo,
+    pub(crate) capability: Capability,
 }
 
 impl EtcdBackend {
     fn new(core: EtcdCore, root: &str) -> Self {
-        let info = AccessorInfo::default();
-        info.set_scheme(ETCD_SCHEME);
-        info.set_name("etcd");
-        info.set_root(root);
-        info.set_native_capability(Capability {
+        let info = ServiceInfo::new(ETCD_SCHEME, root, "etcd");
+        let capability = Capability {
             read: true,
 
             write: true,
@@ -194,27 +193,38 @@ impl EtcdBackend {
             shared: true,
 
             ..Default::default()
-        });
+        };
 
         Self {
             core: Arc::new(core),
-            info: Arc::new(info),
+            info,
+            capability,
         }
     }
 }
 
-impl Access for EtcdBackend {
-    type Reader = Buffer;
+impl Service for EtcdBackend {
+    type Reader = oio::StreamReader<EtcdReader>;
     type Writer = EtcdWriter;
-    type Lister = oio::HierarchyLister<EtcdLister>;
+    type Lister = oio::HierarchyLister<EtcdLazyLister>;
     type Deleter = oio::OneShotDeleter<EtcdDeleter>;
     type Copier = ();
+    type Composer = ();
 
-    fn info(&self) -> Arc<AccessorInfo> {
+    fn info(&self) -> ServiceInfo {
         self.info.clone()
     }
 
-    async fn create_dir(&self, path: &str, _args: OpCreateDir) -> Result<RpCreateDir> {
+    fn capability(&self) -> Capability {
+        self.capability
+    }
+
+    async fn create_dir(
+        &self,
+        _ctx: &OperationContext,
+        path: &str,
+        _args: OpCreateDir,
+    ) -> Result<RpCreateDir> {
         let abs_path = build_abs_path(&self.info.root(), path);
 
         // In etcd, we simulate directory creation by storing an empty value
@@ -231,15 +241,18 @@ impl Access for EtcdBackend {
         Ok(RpCreateDir::default())
     }
 
-    async fn stat(&self, path: &str, _: OpStat) -> Result<RpStat> {
+    async fn stat(&self, _ctx: &OperationContext, path: &str, _: OpStat) -> Result<RpStat> {
         let abs_path = build_abs_path(&self.info.root(), path);
 
         // First check if it's a direct key
         match self.core.get(&abs_path).await? {
             Some(buffer) => {
-                let mut metadata = Metadata::new(EntryMode::from_path(&abs_path));
-                metadata.set_content_length(buffer.len() as u64);
-                Ok(RpStat::new(metadata))
+                let metadata = if abs_path.ends_with('/') {
+                    MetadataBuilder::dir()
+                } else {
+                    MetadataBuilder::file(buffer.len() as u64)
+                };
+                Ok(RpStat::new(metadata.build()))
             }
             None => {
                 // Check if it's a directory by looking for keys with this prefix
@@ -253,7 +266,7 @@ impl Access for EtcdBackend {
                 let has_children = self.core.has_prefix(&prefix).await?;
                 if has_children {
                     // Has children, it's a directory
-                    let metadata = Metadata::new(EntryMode::DIR);
+                    let metadata = MetadataBuilder::dir().build();
                     Ok(RpStat::new(metadata))
                 } else {
                     Err(Error::new(ErrorKind::NotFound, "path not found"))
@@ -261,63 +274,89 @@ impl Access for EtcdBackend {
             }
         }
     }
+    fn read(&self, _ctx: &OperationContext, path: &str, op: OpRead) -> Result<Self::Reader> {
+        let output: oio::StreamReader<EtcdReader> = {
+            Ok(oio::StreamReader::new(EtcdReader::new(
+                self.clone(),
+                path,
+                op,
+            )))
+        }?;
 
-    async fn read(&self, path: &str, op: OpRead) -> Result<(RpRead, Self::Reader)> {
-        let abs_path = build_abs_path(&self.info.root(), path);
-
-        match self.core.get(&abs_path).await? {
-            Some(buffer) => {
-                let range = op.range();
-                let total_size = buffer.len() as u64;
-
-                // If range is full, return the buffer directly
-                if range.is_full() {
-                    let metadata = Metadata::new(EntryMode::FILE).with_content_length(total_size);
-                    return Ok((RpRead::new(metadata), buffer));
-                }
-
-                // Handle range requests
-                let offset = range.offset() as usize;
-                if offset >= buffer.len() {
-                    return Err(Error::new(
-                        ErrorKind::RangeNotSatisfied,
-                        "range start offset exceeds content length",
-                    ));
-                }
-
-                let size = range.size().map(|s| s as usize);
-                let end = size.map_or(buffer.len(), |s| (offset + s).min(buffer.len()));
-                let sliced_buffer = buffer.slice(offset..end);
-                let metadata = Metadata::new(EntryMode::FILE).with_content_length(total_size);
-
-                Ok((RpRead::new(metadata), sliced_buffer))
-            }
-            None => Err(Error::new(ErrorKind::NotFound, "path not found")),
-        }
+        Ok(output)
     }
 
-    async fn write(&self, path: &str, _op: OpWrite) -> Result<(RpWrite, Self::Writer)> {
-        let abs_path = build_abs_path(&self.info.root(), path);
-        let writer = EtcdWriter::new(self.core.clone(), abs_path);
-        Ok((RpWrite::new(), writer))
+    fn write(&self, _ctx: &OperationContext, path: &str, _op: OpWrite) -> Result<Self::Writer> {
+        let output: EtcdWriter = {
+            let abs_path = build_abs_path(&self.info.root(), path);
+            let writer = EtcdWriter::new(self.core.clone(), abs_path);
+            Ok(writer)
+        }?;
+
+        Ok(output)
     }
 
-    async fn delete(&self) -> Result<(RpDelete, Self::Deleter)> {
-        let deleter = oio::OneShotDeleter::new(EtcdDeleter::new(
-            self.core.clone(),
-            self.info.root().to_string(),
-        ));
-        Ok((RpDelete::default(), deleter))
+    fn delete(&self, _ctx: &OperationContext) -> Result<Self::Deleter> {
+        let output: oio::OneShotDeleter<EtcdDeleter> = {
+            let deleter = oio::OneShotDeleter::new(EtcdDeleter::new(
+                self.core.clone(),
+                self.info.root().to_string(),
+            ));
+            Ok(deleter)
+        }?;
+
+        Ok(output)
     }
 
-    async fn list(&self, path: &str, args: OpList) -> Result<(RpList, Self::Lister)> {
-        let lister = EtcdLister::new(
-            self.core.clone(),
-            self.info.root().to_string(),
-            path.to_string(),
-        )
-        .await?;
-        let lister = oio::HierarchyLister::new(lister, path, args.recursive());
-        Ok((RpList::default(), lister))
+    fn list(&self, _ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+        let output: oio::HierarchyLister<EtcdLazyLister> = {
+            let lister = EtcdLazyLister::new(
+                self.core.clone(),
+                self.info.root().to_string(),
+                path.to_string(),
+            );
+            let lister = oio::HierarchyLister::new(lister, path, args.recursive());
+            Ok(lister)
+        }?;
+
+        Ok(output)
+    }
+
+    fn copy(
+        &self,
+        _ctx: &OperationContext,
+        _from: &str,
+        _to: &str,
+        _args: OpCopy,
+    ) -> Result<Self::Copier> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "operation is not supported",
+        ))
+    }
+
+    async fn rename(
+        &self,
+        _ctx: &OperationContext,
+        _from: &str,
+        _to: &str,
+        _args: OpRename,
+    ) -> Result<RpRename> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "operation is not supported",
+        ))
+    }
+
+    async fn presign(
+        &self,
+        _ctx: &OperationContext,
+        _path: &str,
+        _args: OpPresign,
+    ) -> Result<RpPresign> {
+        Err(Error::new(
+            ErrorKind::Unsupported,
+            "operation is not supported",
+        ))
     }
 }

@@ -26,52 +26,6 @@ import (
 	"github.com/jupiterrider/ffi"
 )
 
-// Check verifies if the operator is functioning correctly.
-//
-// This function performs a health check on the operator by sending a `list` request
-// to the root path. It returns any errors encountered during this process.
-//
-// # Returns
-//
-//   - error: An error if the check fails, or nil if the operator is working correctly.
-//
-// # Details
-//
-// The check is performed by attempting to list the contents of the root directory.
-// This operation tests the basic functionality of the operator, including
-// connectivity and permissions.
-//
-// # Example
-//
-//	func exampleCheck(op *opendal.Operator) {
-//		err = op.Check()
-//		if err != nil {
-//			log.Printf("Operator check failed: %v", err)
-//		} else {
-//			log.Println("Operator is functioning correctly")
-//		}
-//	}
-//
-// Note: This example assumes proper error handling and import statements.
-func (op *Operator) Check() (err error) {
-	ds, err := op.List("/")
-	if err != nil {
-		return
-	}
-	defer func() {
-		closeErr := ds.Close()
-		if err == nil {
-			err = closeErr
-		}
-	}()
-	ds.Next()
-	err = ds.Error()
-	if err, ok := err.(*Error); ok && err.Code() == CodeNotFound {
-		return nil
-	}
-	return
-}
-
 // List returns a Lister to iterate over entries that start with the given path in the parent directory.
 //
 // WithListFn is a functional option for the List operation.
@@ -86,9 +40,52 @@ func ListWithRecursive(recursive bool) WithListFn {
 	}
 }
 
+// ListWithLimit sets the maximum number of results per request hint for the list operation.
+//
+// This is a hint to the backend; the actual number of results may differ.
+// A value of 0 means no limit is set.
+func ListWithLimit(limit uint) WithListFn {
+	return func(o *listOptions) {
+		o.limit = limit
+	}
+}
+
+// ListWithStartAfter sets the start-after key for the list operation.
+//
+// Passes the specified key to the underlying service to start listing from.
+func ListWithStartAfter(startAfter string) WithListFn {
+	return func(o *listOptions) {
+		o.startAfter = &startAfter
+	}
+}
+
+// ListWithVersions sets the versions flag for the list operation.
+//
+// When versions is true, the list operation will include all object versions.
+// This option is only meaningful on version-aware backends.
+func ListWithVersions(versions bool) WithListFn {
+	return func(o *listOptions) {
+		o.versions = versions
+	}
+}
+
+// ListWithDeleted sets the deleted flag for the list operation.
+//
+// When deleted is true, the list operation will include delete markers.
+// This option is only meaningful on version-aware backends.
+func ListWithDeleted(deleted bool) WithListFn {
+	return func(o *listOptions) {
+		o.deleted = deleted
+	}
+}
+
 // listOptions holds the options for a list operation.
 type listOptions struct {
-	recursive bool
+	recursive  bool
+	limit      uint
+	startAfter *string
+	versions   bool
+	deleted    bool
 }
 
 // List returns a Lister to iterate over entries that start with the given path.
@@ -139,6 +136,14 @@ func (op *Operator) List(path string, opts ...WithListFn) (*Lister, error) {
 	cOpts := ffiListOptionsNew.symbol(op.ctx)()
 	defer ffiListOptionsFree.symbol(op.ctx)(cOpts)
 	ffiListOptionsSetRecursive.symbol(op.ctx)(cOpts, o.recursive)
+	if o.limit > 0 {
+		ffiListOptionsSetLimit.symbol(op.ctx)(cOpts, o.limit)
+	}
+	if o.startAfter != nil {
+		ffiListOptionsSetStartAfter.symbol(op.ctx)(cOpts, *o.startAfter)
+	}
+	ffiListOptionsSetVersions.symbol(op.ctx)(cOpts, o.versions)
+	ffiListOptionsSetDeleted.symbol(op.ctx)(cOpts, o.deleted)
 	listerInner, err := ffiOperatorListWith.symbol(op.ctx)(op.inner, path, cOpts)
 	if err != nil {
 		return nil, err
@@ -345,6 +350,75 @@ var ffiListOptionsSetRecursive = newFFI(ffiOpts{
 			nil,
 			unsafe.Pointer(&opts),
 			unsafe.Pointer(&r),
+		)
+	}
+})
+
+var ffiListOptionsSetLimit = newFFI(ffiOpts{
+	sym:    "opendal_list_options_set_limit",
+	rType:  &ffi.TypeVoid,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(_ context.Context, ffiCall ffiCall) func(opts *opendalListOptions, limit uint) {
+	return func(opts *opendalListOptions, limit uint) {
+		l := uintptr(limit)
+		ffiCall(
+			nil,
+			unsafe.Pointer(&opts),
+			unsafe.Pointer(&l),
+		)
+	}
+})
+
+var ffiListOptionsSetStartAfter = newFFI(ffiOpts{
+	sym:    "opendal_list_options_set_start_after",
+	rType:  &ffi.TypeVoid,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypePointer},
+}, func(_ context.Context, ffiCall ffiCall) func(opts *opendalListOptions, startAfter string) {
+	return func(opts *opendalListOptions, startAfter string) {
+		bytePtr, err := BytePtrFromString(startAfter)
+		if err != nil {
+			return
+		}
+		ffiCall(
+			nil,
+			unsafe.Pointer(&opts),
+			unsafe.Pointer(&bytePtr),
+		)
+	}
+})
+
+var ffiListOptionsSetVersions = newFFI(ffiOpts{
+	sym:    "opendal_list_options_set_versions",
+	rType:  &ffi.TypeVoid,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypeUint8},
+}, func(_ context.Context, ffiCall ffiCall) func(opts *opendalListOptions, versions bool) {
+	return func(opts *opendalListOptions, versions bool) {
+		var v uint8
+		if versions {
+			v = 1
+		}
+		ffiCall(
+			nil,
+			unsafe.Pointer(&opts),
+			unsafe.Pointer(&v),
+		)
+	}
+})
+
+var ffiListOptionsSetDeleted = newFFI(ffiOpts{
+	sym:    "opendal_list_options_set_deleted",
+	rType:  &ffi.TypeVoid,
+	aTypes: []*ffi.Type{&ffi.TypePointer, &ffi.TypeUint8},
+}, func(_ context.Context, ffiCall ffiCall) func(opts *opendalListOptions, deleted bool) {
+	return func(opts *opendalListOptions, deleted bool) {
+		var d uint8
+		if deleted {
+			d = 1
+		}
+		ffiCall(
+			nil,
+			unsafe.Pointer(&opts),
+			unsafe.Pointer(&d),
 		)
 	}
 })

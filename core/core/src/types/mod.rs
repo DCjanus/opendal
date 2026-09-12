@@ -21,11 +21,23 @@ pub use mode::EntryMode;
 mod buffer;
 pub use buffer::Buffer;
 
+pub(crate) mod compact;
+
+mod http_transport;
+pub use http_transport::HttpBody;
+pub use http_transport::HttpRedirect;
+pub use http_transport::HttpTransport;
+pub use http_transport::HttpTransporter;
+pub use http_transport::HttpUri;
+
 mod entry;
 pub use entry::Entry;
 
-mod metadata;
+pub(crate) mod metadata;
 pub use metadata::Metadata;
+pub use metadata::MetadataBuilder;
+pub use metadata::UserMetadata;
+pub use metadata::UserMetadataIntoIter;
 
 mod read;
 pub use read::*;
@@ -39,6 +51,9 @@ pub use list::Lister;
 mod copy;
 pub use copy::Copier;
 
+mod compose;
+pub use compose::*;
+
 mod delete;
 pub use delete::*;
 
@@ -48,7 +63,6 @@ pub use execute::*;
 mod operator;
 pub use operator::IntoOperatorUri;
 pub use operator::Operator;
-pub use operator::OperatorBuilder;
 pub use operator::OperatorFactory;
 pub use operator::OperatorInfo;
 pub use operator::OperatorRegistry;
@@ -67,7 +81,11 @@ pub use error::Result;
 mod capability;
 pub use capability::Capability;
 
+mod bytes_range;
+pub use bytes_range::BytesRange;
+
 pub mod options;
 
 mod context;
+pub use context::OperationContext;
 pub(crate) use context::*;

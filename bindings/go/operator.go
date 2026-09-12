@@ -27,42 +27,6 @@ import (
 	"github.com/jupiterrider/ffi"
 )
 
-// Copy duplicates a file from the source path to the destination path.
-//
-// This function copies the contents of the file at 'from' to a new or existing file at 'to'.
-//
-// # Parameters
-//
-//   - from: The source file path.
-//   - to: The destination file path.
-//
-// # Returns
-//
-//   - error: An error if the copy operation fails, or nil if successful.
-//
-// # Behavior
-//
-//   - Both 'from' and 'to' must be file paths, not directories.
-//   - If 'to' already exists, it will be overwritten.
-//   - If 'from' and 'to' are identical, an 'IsSameFile' error will be returned.
-//   - The copy operation is idempotent; repeated calls with the same parameters will yield the same result.
-//
-// # Example
-//
-//	func exampleCopy(op *operatorCopy) {
-//		err = op.Copy("path/from/file", "path/to/file")
-//		if err != nil {
-//			log.Printf("Copy operation failed: %v", err)
-//		} else {
-//			log.Println("File copied successfully")
-//		}
-//	}
-//
-// Note: This example assumes proper error handling and import statements.
-func (op *Operator) Copy(src, dest string) error {
-	return ffiOperatorCopy.symbol(op.ctx)(op.inner, src, dest)
-}
-
 // Rename changes the name or location of a file from the source path to the destination path.
 //
 // This function moves a file from 'from' to 'to', effectively renaming or relocating it.
@@ -96,6 +60,32 @@ func (op *Operator) Copy(src, dest string) error {
 // Note: This example assumes proper error handling and import statements.
 func (op *Operator) Rename(src, dest string) error {
 	return ffiOperatorRename.symbol(op.ctx)(op.inner, src, dest)
+}
+
+// Check verifies if the operator is functioning correctly.
+//
+// Check is a wrapper around the C-binding function `opendal_operator_check`.
+// It performs a health check against the underlying backend, returning any
+// error encountered while reaching it.
+//
+// # Returns
+//
+//   - error: An error if the check fails, or nil if the operator is working correctly.
+//
+// # Example
+//
+//	func exampleCheck(op *opendal.Operator) {
+//		err = op.Check()
+//		if err != nil {
+//			log.Printf("Operator check failed: %v", err)
+//		} else {
+//			log.Println("Operator is functioning correctly")
+//		}
+//	}
+//
+// Note: This example assumes proper error handling and import statements.
+func (op *Operator) Check() error {
+	return ffiOperatorCheck.symbol(op.ctx)(op.inner)
 }
 
 func normalizeScheme(scheme Scheme) (*byte, error) {
@@ -248,6 +238,21 @@ var ffiOperatorRename = newFFI(ffiOpts{
 			unsafe.Pointer(&op),
 			unsafe.Pointer(&byteSrc),
 			unsafe.Pointer(&byteDest),
+		)
+		return parseError(ctx, e)
+	}
+})
+
+var ffiOperatorCheck = newFFI(ffiOpts{
+	sym:    "opendal_operator_check",
+	rType:  &ffi.TypePointer,
+	aTypes: []*ffi.Type{&ffi.TypePointer},
+}, func(ctx context.Context, ffiCall ffiCall) func(op *opendalOperator) error {
+	return func(op *opendalOperator) error {
+		var e *opendalError
+		ffiCall(
+			unsafe.Pointer(&e),
+			unsafe.Pointer(&op),
 		)
 		return parseError(ctx, e)
 	}

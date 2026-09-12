@@ -56,12 +56,13 @@ jobs:
           - { service: "s3", setup: "0_minio_s3" }
           - { service: "azblob", setup: "azurite_azblob" }
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup
       - name: Set Rust Fuzz
         shell: bash
         run: |
+          sudo apt-get update
           sudo apt-get install -y libfuzzer-14-dev
           rustup install ${{ env.RUST_TOOLCHAIN }}
           cargo +${{ env.RUST_TOOLCHAIN }} install cargo-fuzz

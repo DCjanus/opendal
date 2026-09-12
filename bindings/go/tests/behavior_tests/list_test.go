@@ -48,6 +48,18 @@ func testsList(cap *opendal.Capability) []behaviorTest {
 	if cap.ListWithRecursive() {
 		tests = append(tests, testListWithRecursive)
 	}
+	if cap.ListWithLimit() {
+		tests = append(tests, testListWithLimit)
+	}
+	if cap.ListWithStartAfter() {
+		tests = append(tests, testListWithStartAfter)
+	}
+	if isCapEnabled(cap.ListWithVersions, "list_with_versions") {
+		tests = append(tests, testListWithVersions)
+	}
+	if isCapEnabled(cap.ListWithDeleted, "list_with_deleted") {
+		tests = append(tests, testListWithDeleted)
+	}
 	return tests
 }
 
@@ -59,7 +71,8 @@ func testListDir(assert *require.Assertions, op *opendal.Operator, fixture *fixt
 	parent := fixture.NewDirPath()
 	path, content, size := fixture.NewFileWithPath(fmt.Sprintf("%s%s", parent, uuid.NewString()))
 
-	assert.Nil(op.Write(path, content), "write must succeed")
+	_, err := op.Write(path, content)
+	assert.Nil(err, "write must succeed")
 
 	obs, err := op.List(parent)
 	assert.Nil(err)
@@ -92,7 +105,8 @@ func testListRichDir(assert *require.Assertions, op *opendal.Operator, fixture *
 	for range 10 {
 		path, content, _ := fixture.NewFileWithPath(fmt.Sprintf("%s%s", parent, uuid.NewString()))
 		expected = append(expected, path)
-		assert.Nil(op.Write(path, content))
+		_, err := op.Write(path, content)
+		assert.Nil(err)
 	}
 
 	obs, err := op.List(parent)
@@ -185,7 +199,8 @@ func testListNestedDir(assert *require.Assertions, op *opendal.Operator, fixture
 
 	assert.Nil(op.CreateDir(parent), "create must succeed")
 	assert.Nil(op.CreateDir(dir), "create must succeed")
-	assert.Nil(op.Write(filePath, []byte("test_list_nested_dir")), "write must succeed")
+	_, err := op.Write(filePath, []byte("test_list_nested_dir"))
+	assert.Nil(err, "write must succeed")
 	assert.Nil(op.CreateDir(dirPath), "create must succeed")
 
 	obs, err := op.List(parent)
@@ -248,7 +263,8 @@ func testListEntryMetadata(assert *require.Assertions, op *opendal.Operator, fix
 	assert.Nil(op.CreateDir(parent))
 
 	filePath, content, size := fixture.NewFileWithPath(fmt.Sprintf("%s%s", parent, uuid.NewString()))
-	assert.Nil(op.Write(filePath, content))
+	_, err := op.Write(filePath, content)
+	assert.Nil(err)
 
 	obs, err := op.List(parent)
 	assert.Nil(err)
@@ -282,7 +298,8 @@ func testListDirWithFilePath(assert *require.Assertions, op *opendal.Operator, f
 	parent := fixture.NewDirPath()
 	path, content, _ := fixture.NewFileWithPath(fmt.Sprintf("%s%s", parent, uuid.NewString()))
 
-	assert.Nil(op.Write(path, content))
+	_, err := op.Write(path, content)
+	assert.Nil(err)
 
 	obs, err := op.List(strings.TrimSuffix(parent, "/"))
 	assert.Nil(err)
@@ -303,8 +320,10 @@ func testListWithDefaultOptions(assert *require.Assertions, op *opendal.Operator
 
 	assert.Nil(op.CreateDir(parent))
 	assert.Nil(op.CreateDir(subDir))
-	assert.Nil(op.Write(fileInParent, content))
-	assert.Nil(op.Write(fileInSub, content))
+	_, err := op.Write(fileInParent, content)
+	assert.Nil(err)
+	_, err = op.Write(fileInSub, content)
+	assert.Nil(err)
 
 	obs, err := op.List(parent)
 	assert.Nil(err)
@@ -336,9 +355,12 @@ func testListWithRecursive(assert *require.Assertions, op *opendal.Operator, fix
 	assert.Nil(op.CreateDir(parent))
 	assert.Nil(op.CreateDir(subDir))
 	assert.Nil(op.CreateDir(deepDir))
-	assert.Nil(op.Write(fileTop, content))
-	assert.Nil(op.Write(fileMid, content))
-	assert.Nil(op.Write(fileDeep, content))
+	_, err := op.Write(fileTop, content)
+	assert.Nil(err)
+	_, err = op.Write(fileMid, content)
+	assert.Nil(err)
+	_, err = op.Write(fileDeep, content)
+	assert.Nil(err)
 
 	obs, err := op.List(parent, opendal.ListWithRecursive(true))
 	assert.Nil(err)
@@ -353,4 +375,136 @@ func testListWithRecursive(assert *require.Assertions, op *opendal.Operator, fix
 	assert.Contains(paths, fileTop, "recursive list must include top-level file")
 	assert.Contains(paths, fileMid, "recursive list must include file in sub-directory")
 	assert.Contains(paths, fileDeep, "recursive list must include file in deep directory")
+}
+
+func testListWithLimit(assert *require.Assertions, op *opendal.Operator, fixture *fixture) {
+	parent := fixture.NewDirPath()
+	assert.Nil(op.CreateDir(parent))
+
+	// Write 5 files.
+	for range 5 {
+		path, content, _ := fixture.NewFileWithPath(fmt.Sprintf("%s%s", parent, uuid.NewString()))
+		_, err := op.Write(path, content)
+		assert.Nil(err)
+	}
+
+	// List with limit=2; the operation must succeed without error.
+	obs, err := op.List(parent, opendal.ListWithLimit(2))
+	assert.Nil(err)
+	defer obs.Close()
+
+	var paths []string
+	for obs.Next() {
+		paths = append(paths, obs.Entry().Path())
+	}
+	assert.Nil(obs.Error())
+	// At least one entry must be returned (limit is a hint, not a hard cap for all backends).
+	assert.NotEmpty(paths, "list with limit must return at least one entry")
+}
+
+func testListWithStartAfter(assert *require.Assertions, op *opendal.Operator, fixture *fixture) {
+	parent := fixture.NewDirPath()
+	assert.Nil(op.CreateDir(parent))
+
+	// Write files with predictable sorted names.
+	var filePaths []string
+	for i := range 5 {
+		name := fmt.Sprintf("%sfile-%02d", parent, i)
+		filePaths = append(filePaths, name)
+		_, err := op.Write(name, []byte("content"))
+		assert.Nil(err)
+	}
+	slices.Sort(filePaths)
+
+	// Start listing from the second file (index 1).
+	pivotName := strings.TrimPrefix(filePaths[1], "/")
+	obs, err := op.List(parent, opendal.ListWithStartAfter(pivotName))
+	assert.Nil(err)
+	defer obs.Close()
+
+	var paths []string
+	for obs.Next() {
+		paths = append(paths, obs.Entry().Path())
+	}
+	assert.Nil(obs.Error())
+
+	// Files after the pivot must appear.
+	for _, p := range filePaths[2:] {
+		assert.Contains(paths, p, "start_after must include entries after pivot")
+	}
+}
+
+func testListWithVersions(assert *require.Assertions, op *opendal.Operator, fixture *fixture) {
+	parent := fixture.NewDirPath()
+	path, _, _ := fixture.NewFileWithPath(fmt.Sprintf("%s%s", parent, uuid.NewString()))
+
+	_, err := op.Write(path, []byte("version-1"))
+	assert.Nil(err, "first write must succeed")
+	_, err = op.Write(path, []byte("version-2"))
+	assert.Nil(err, "second write must succeed")
+
+	obs, err := op.List(path, opendal.ListWithVersions(true))
+	assert.Nil(err, "list with versions must succeed")
+	defer obs.Close()
+
+	var count int
+	var currentCount int
+	for obs.Next() {
+		entry := obs.Entry()
+		if entry.Path() == path {
+			count++
+			meta := entry.Metadata()
+			version, ok := meta.Version()
+			assert.True(ok, "version metadata must be present for list with versions")
+			assert.NotEmpty(version, "each version entry must have a version ID")
+			if curr, ok := meta.IsCurrent(); ok && curr {
+				currentCount++
+			}
+		}
+	}
+	assert.Nil(obs.Error())
+	assert.GreaterOrEqual(count, 2, "list with versions must return at least 2 entries for the same path")
+	assert.Equal(1, currentCount, "exactly one version entry should be current")
+}
+
+func testListWithDeleted(assert *require.Assertions, op *opendal.Operator, fixture *fixture) {
+	parent := fixture.NewDirPath()
+	path, content, _ := fixture.NewFileWithPath(fmt.Sprintf("%s%s", parent, uuid.NewString()))
+
+	_, err := op.Write(path, content)
+	assert.Nil(err, "write must succeed")
+
+	obs, err := op.List(path, opendal.ListWithDeleted(true))
+	assert.Nil(err, "list with deleted must succeed before deletion")
+	defer obs.Close()
+	var beforeCount int
+	for obs.Next() {
+		if obs.Entry().Path() == path {
+			beforeCount++
+		}
+	}
+	assert.Nil(obs.Error())
+	assert.Equal(1, beforeCount, "active file must appear exactly once before deletion")
+
+	assert.Nil(op.Delete(path), "delete must succeed")
+
+	obs2, err := op.List(path, opendal.ListWithDeleted(true))
+	assert.Nil(err, "list with deleted must succeed after deletion")
+	defer obs2.Close()
+	var foundDeleteMarker bool
+	for obs2.Next() {
+		entry := obs2.Entry()
+		if entry.Path() == path {
+			meta := entry.Metadata()
+			if meta != nil && meta.IsDeleted() {
+				version, ok := meta.Version()
+				assert.True(ok, "delete marker must have a version ID")
+				assert.NotEmpty(version, "delete marker must have a version ID")
+				foundDeleteMarker = true
+				break
+			}
+		}
+	}
+	assert.Nil(obs2.Error())
+	assert.True(foundDeleteMarker, "delete marker must be found after deletion")
 }

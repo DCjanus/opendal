@@ -15,11 +15,10 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Throttle layer implementation for Apache OpenDAL.
-
+#![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(docsrs, doc(auto_cfg))]
 #![deny(missing_docs)]
-
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
@@ -32,14 +31,13 @@ use governor::state::NotKeyed;
 use opendal_core::raw::*;
 use opendal_core::*;
 
-/// Add a bandwidth rate limiter to the underlying services.
+/// `ThrottleLayer` limits bandwidth for storage services.
 ///
 /// # Throttle
 ///
-/// There are several algorithms when it come to rate limiting techniques.
-/// This throttle layer uses Generic Cell Rate Algorithm (GCRA) provided by
+/// This layer uses the Generic Cell Rate Algorithm (GCRA) from
 /// [Governor](https://docs.rs/governor/latest/governor/index.html).
-/// By setting the `bandwidth` and `burst`, we can control the byte flow rate of underlying services.
+/// Set `bandwidth` and `burst` to control the service's byte-flow rate.
 ///
 /// # Note
 ///
@@ -61,15 +59,13 @@ use opendal_core::*;
 /// # fn main() -> Result<()> {
 /// let _ = Operator::new(services::Memory::default())
 ///     .expect("must init")
-///     .layer(ThrottleLayer::new(10 * 1024, 10000 * 1024))
-///     .finish();
+///     .layer(ThrottleLayer::new(10 * 1024, 10000 * 1024));
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ThrottleLayer {
-    bandwidth: NonZeroU32,
-    burst: NonZeroU32,
+    rate_limiter: SharedRateLimiter,
 }
 
 impl ThrottleLayer {
@@ -81,22 +77,25 @@ impl ThrottleLayer {
         assert!(bandwidth > 0);
         assert!(burst > 0);
         Self {
-            bandwidth: NonZeroU32::new(bandwidth).unwrap(),
-            burst: NonZeroU32::new(burst).unwrap(),
+            rate_limiter: Arc::new(RateLimiter::direct(
+                Quota::per_second(NonZeroU32::new(bandwidth).unwrap())
+                    .allow_burst(NonZeroU32::new(burst).unwrap()),
+            )),
         }
     }
 }
 
-impl<A: Access> Layer<A> for ThrottleLayer {
-    type LayeredAccess = ThrottleAccessor<A>;
+impl Layer for ThrottleLayer {
+    fn apply_service(&self, inner: Servicer) -> Servicer {
+        Arc::new(self.layer(inner))
+    }
+}
 
-    fn layer(&self, inner: A) -> Self::LayeredAccess {
-        let rate_limiter = Arc::new(RateLimiter::direct(
-            Quota::per_second(self.bandwidth).allow_burst(self.burst),
-        ));
+impl ThrottleLayer {
+    fn layer(&self, inner: Servicer) -> ThrottleAccessor {
         ThrottleAccessor {
             inner,
-            rate_limiter,
+            rate_limiter: self.rate_limiter.clone(),
         }
     }
 }
@@ -108,57 +107,104 @@ type SharedRateLimiter = Arc<RateLimiter<NotKeyed, InMemoryState, DefaultClock, 
 
 #[doc(hidden)]
 #[derive(Debug)]
-pub struct ThrottleAccessor<A: Access> {
-    inner: A,
+pub struct ThrottleAccessor {
+    inner: Servicer,
     rate_limiter: SharedRateLimiter,
 }
 
-impl<A: Access> LayeredAccess for ThrottleAccessor<A> {
-    type Inner = A;
-    type Reader = ThrottleWrapper<A::Reader>;
-    type Writer = ThrottleWrapper<A::Writer>;
-    type Lister = A::Lister;
-    type Deleter = A::Deleter;
-    type Copier = A::Copier;
+impl Service for ThrottleAccessor {
+    type Reader = ThrottleWrapper<oio::Reader>;
+    type Writer = ThrottleWrapper<oio::Writer>;
+    type Lister = oio::Lister;
+    type Deleter = oio::Deleter;
+    type Copier = oio::Copier;
+    type Composer = oio::Composer;
 
-    fn inner(&self) -> &Self::Inner {
-        &self.inner
+    fn info(&self) -> ServiceInfo {
+        self.inner.info()
     }
 
-    async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
-        let limiter = self.rate_limiter.clone();
-
-        self.inner
-            .read(path, args)
-            .await
-            .map(|(rp, r)| (rp, ThrottleWrapper::new(r, limiter)))
+    fn capability(&self) -> Capability {
+        self.inner.capability()
     }
 
-    async fn write(&self, path: &str, args: OpWrite) -> Result<(RpWrite, Self::Writer)> {
-        let limiter = self.rate_limiter.clone();
-
-        self.inner
-            .write(path, args)
-            .await
-            .map(|(rp, w)| (rp, ThrottleWrapper::new(w, limiter)))
+    fn compose(&self, ctx: &OperationContext, to: &str, args: OpCompose) -> Result<Self::Composer> {
+        self.inner.compose(ctx, to, args)
     }
 
-    async fn copy(
+    async fn create_dir(
         &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpCreateDir,
+    ) -> Result<RpCreateDir> {
+        self.inner.create_dir(ctx, path, args).await
+    }
+
+    async fn stat(&self, ctx: &OperationContext, path: &str, args: OpStat) -> Result<RpStat> {
+        self.inner.stat(ctx, path, args).await
+    }
+
+    fn read(&self, ctx: &OperationContext, path: &str, args: OpRead) -> Result<Self::Reader> {
+        let limiter = self.rate_limiter.clone();
+
+        self.inner
+            .read(ctx, path, args)
+            .map(|r| ThrottleWrapper::new(r, limiter))
+    }
+
+    fn write(&self, ctx: &OperationContext, path: &str, args: OpWrite) -> Result<Self::Writer> {
+        let limiter = self.rate_limiter.clone();
+
+        self.inner
+            .write(ctx, path, args)
+            .map(|w| ThrottleWrapper::new(w, limiter))
+    }
+
+    fn copy(
+        &self,
+        ctx: &OperationContext,
         from: &str,
         to: &str,
         args: OpCopy,
-        opts: OpCopier,
-    ) -> Result<(RpCopy, Self::Copier)> {
-        self.inner.copy(from, to, args, opts).await
+    ) -> Result<Self::Copier> {
+        self.inner.copy(ctx, from, to, args)
     }
 
-    async fn delete(&self) -> Result<(RpDelete, Self::Deleter)> {
-        self.inner.delete().await
+    fn delete(&self, ctx: &OperationContext) -> Result<Self::Deleter> {
+        self.inner.delete(ctx)
     }
 
-    async fn list(&self, path: &str, args: OpList) -> Result<(RpList, Self::Lister)> {
-        self.inner.list(path, args).await
+    async fn rename(
+        &self,
+        ctx: &OperationContext,
+        from: &str,
+        to: &str,
+        args: OpRename,
+    ) -> Result<RpRename> {
+        self.inner.rename(ctx, from, to, args).await
+    }
+
+    async fn restore(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpRestore,
+    ) -> Result<RpRestore> {
+        self.inner.restore(ctx, path, args).await
+    }
+
+    fn list(&self, ctx: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
+        self.inner.list(ctx, path, args)
+    }
+
+    async fn presign(
+        &self,
+        ctx: &OperationContext,
+        path: &str,
+        args: OpPresign,
+    ) -> Result<RpPresign> {
+        self.inner.presign(ctx, path, args).await
     }
 }
 
@@ -177,9 +223,24 @@ impl<R> ThrottleWrapper<R> {
     }
 }
 
-impl<R: oio::Read> oio::Read for ThrottleWrapper<R> {
+impl<R: oio::ReadStream> oio::ReadStream for ThrottleWrapper<R> {
     async fn read(&mut self) -> Result<Buffer> {
         self.inner.read().await
+    }
+}
+
+impl<R: oio::Read> oio::Read for ThrottleWrapper<R> {
+    async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        let (rp, stream) = self.inner.open(range).await?;
+        Ok((
+            rp,
+            Box::new(ThrottleWrapper::new(stream, self.limiter.clone()))
+                as Box<dyn oio::ReadStreamDyn>,
+        ))
+    }
+
+    async fn read(&self, range: BytesRange) -> Result<(RpRead, Buffer)> {
+        self.inner.read(range).await
     }
 }
 
@@ -208,6 +269,10 @@ impl<R: oio::Write> oio::Write for ThrottleWrapper<R> {
         })?;
 
         self.inner.write(bs).await
+    }
+
+    async fn copy_from(&mut self, path: &str, args: OpRead, range: BytesRange) -> Result<()> {
+        self.inner.copy_from(path, args, range).await
     }
 
     async fn close(&mut self) -> Result<Metadata> {

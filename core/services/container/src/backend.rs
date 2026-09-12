@@ -87,7 +87,7 @@ impl ContainerBuilder {
 impl Builder for ContainerBuilder {
     type Config = ContainerConfig;
 
-    fn build(self) -> Result<impl Access> {
+    fn build(self) -> Result<impl Service> {
         let layout = self.config.layout.ok_or_else(|| {
             Error::new(ErrorKind::ConfigInvalid, "layout is not specified")
                 .with_context("service", CONTAINER_SCHEME)
@@ -104,23 +104,21 @@ impl Builder for ContainerBuilder {
         let layout = PathBuf::from(layout);
         let core = load_layout(&layout, &reference, &platform)?;
 
-        let info = AccessorInfo::default();
-        info.set_scheme(CONTAINER_SCHEME);
-        info.set_name(&reference);
-        info.set_root(&root);
-        info.set_native_capability(Capability {
+        let info = ServiceInfo::new(CONTAINER_SCHEME, &root, &reference);
+        let capability = Capability {
             stat: true,
             read: true,
             list: true,
             list_with_recursive: true,
             shared: true,
             ..Default::default()
-        });
+        };
 
         Ok(ContainerBackend {
             core: Arc::new(core),
             root,
-            info: Arc::new(info),
+            info,
+            capability,
         })
     }
 }
@@ -129,24 +127,30 @@ impl Builder for ContainerBuilder {
 pub(crate) struct ContainerBackend {
     core: Arc<ContainerCore>,
     root: String,
-    info: Arc<AccessorInfo>,
+    info: ServiceInfo,
+    capability: Capability,
 }
 
-impl Access for ContainerBackend {
-    type Reader = Buffer;
+impl Service for ContainerBackend {
+    type Reader = oio::StreamReader<ContainerReader>;
     type Writer = ();
     type Lister = oio::HierarchyLister<ContainerLister>;
     type Deleter = ();
     type Copier = ();
+    type Composer = ();
 
-    fn info(&self) -> Arc<AccessorInfo> {
+    fn info(&self) -> ServiceInfo {
         self.info.clone()
     }
 
-    async fn stat(&self, path: &str, _: OpStat) -> Result<RpStat> {
+    fn capability(&self) -> Capability {
+        self.capability
+    }
+
+    async fn stat(&self, _: &OperationContext, path: &str, _: OpStat) -> Result<RpStat> {
         let p = build_abs_path(&self.root, path);
         if p == self.root[1..] || p.is_empty() {
-            return Ok(RpStat::new(Metadata::new(EntryMode::DIR)));
+            return Ok(RpStat::new(MetadataBuilder::dir().build()));
         }
 
         if let Some(entry) = self.core.get(&p) {
@@ -155,7 +159,7 @@ impl Access for ContainerBackend {
 
         let dir_path = if p.ends_with('/') { p } else { format!("{p}/") };
         if self.core.has_children(&dir_path) {
-            return Ok(RpStat::new(Metadata::new(EntryMode::DIR)));
+            return Ok(RpStat::new(MetadataBuilder::dir().build()));
         }
 
         Err(Error::new(
@@ -164,32 +168,14 @@ impl Access for ContainerBackend {
         ))
     }
 
-    async fn read(&self, path: &str, args: OpRead) -> Result<(RpRead, Self::Reader)> {
-        let p = build_abs_path(&self.root, path);
-        let entry = self.core.get(&p).ok_or_else(|| {
-            Error::new(ErrorKind::NotFound, "path is not found in container image")
-        })?;
-        let content = entry.content.ok_or_else(|| {
-            Error::new(
-                ErrorKind::IsADirectory,
-                "path is not a readable regular file",
-            )
-        })?;
-
-        let total_size = content.len() as u64;
-        let range = args.range();
-        let start = range.offset().min(total_size) as usize;
-        let end = match range.size() {
-            Some(size) => range.offset().saturating_add(size).min(total_size),
-            None => total_size,
-        } as usize;
-        let content = content.slice(start..end);
-        let metadata = Metadata::new(EntryMode::FILE).with_content_length(total_size);
-
-        Ok((RpRead::new(metadata), content.into()))
+    fn read(&self, _: &OperationContext, path: &str, _: OpRead) -> Result<Self::Reader> {
+        Ok(oio::StreamReader::new(ContainerReader {
+            backend: self.clone(),
+            path: path.to_string(),
+        }))
     }
 
-    async fn list(&self, path: &str, args: OpList) -> Result<(RpList, Self::Lister)> {
+    fn list(&self, _: &OperationContext, path: &str, args: OpList) -> Result<Self::Lister> {
         let p = build_abs_path(&self.root, path);
         let scan_path = if p.is_empty() || p.ends_with('/') {
             p
@@ -200,8 +186,75 @@ impl Access for ContainerBackend {
         let lister = ContainerLister::new(self.root.clone(), entries);
         let lister = oio::HierarchyLister::new(lister, path, args.recursive());
 
-        Ok((RpList::default(), lister))
+        Ok(lister)
     }
+
+    async fn create_dir(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: OpCreateDir,
+    ) -> Result<RpCreateDir> {
+        Err(unsupported())
+    }
+
+    fn write(&self, _: &OperationContext, _: &str, _: OpWrite) -> Result<Self::Writer> {
+        Err(unsupported())
+    }
+
+    fn delete(&self, _: &OperationContext) -> Result<Self::Deleter> {
+        Err(unsupported())
+    }
+
+    fn copy(&self, _: &OperationContext, _: &str, _: &str, _: OpCopy) -> Result<Self::Copier> {
+        Err(unsupported())
+    }
+
+    async fn rename(
+        &self,
+        _: &OperationContext,
+        _: &str,
+        _: &str,
+        _: OpRename,
+    ) -> Result<RpRename> {
+        Err(unsupported())
+    }
+
+    async fn presign(&self, _: &OperationContext, _: &str, _: OpPresign) -> Result<RpPresign> {
+        Err(unsupported())
+    }
+}
+
+/// Reader returned by the container backend.
+pub struct ContainerReader {
+    backend: ContainerBackend,
+    path: String,
+}
+
+impl oio::StreamRead for ContainerReader {
+    async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
+        let path = build_abs_path(&self.backend.root, &self.path);
+        let entry = self.backend.core.get(&path).ok_or_else(|| {
+            Error::new(ErrorKind::NotFound, "path is not found in container image")
+        })?;
+        let content = entry.content.ok_or_else(|| {
+            Error::new(
+                ErrorKind::IsADirectory,
+                "path is not a readable regular file",
+            )
+        })?;
+        let total_size = content.len() as u64;
+        let content = content.slice(range.to_content_range(content.len())?);
+
+        Ok((
+            RpRead::new(MetadataBuilder::file(total_size).build()),
+            Box::new(content),
+        ))
+    }
+}
+
+fn unsupported() -> Error {
+    Error::new(ErrorKind::Unsupported, "operation is not supported")
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,7 +400,7 @@ fn apply_tar_layer<R: Read>(
             entries.insert(
                 path,
                 ContainerEntry {
-                    metadata: Metadata::new(EntryMode::DIR),
+                    metadata: MetadataBuilder::dir().build(),
                     content: None,
                 },
             );
@@ -368,8 +421,7 @@ fn apply_tar_layer<R: Read>(
             entries.insert(
                 path,
                 ContainerEntry {
-                    metadata: Metadata::new(EntryMode::FILE)
-                        .with_content_length(content.len() as u64),
+                    metadata: MetadataBuilder::file(content.len() as u64).build(),
                     content: Some(content),
                 },
             );
@@ -380,7 +432,7 @@ fn apply_tar_layer<R: Read>(
         entries.insert(
             path,
             ContainerEntry {
-                metadata: Metadata::new(EntryMode::Unknown),
+                metadata: MetadataBuilder::unknown().build(),
                 content: None,
             },
         );
@@ -434,7 +486,7 @@ fn insert_parent_dirs(path: &str, entries: &mut BTreeMap<String, ContainerEntry>
         entries
             .entry(current.clone())
             .or_insert_with(|| ContainerEntry {
-                metadata: Metadata::new(EntryMode::DIR),
+                metadata: MetadataBuilder::dir().build(),
                 content: None,
             });
     }
@@ -528,8 +580,7 @@ mod tests {
                 .layout(dir.path().to_string_lossy())
                 .reference("latest")
                 .platform(ImagePlatform::linux_amd64()),
-        )?
-        .finish();
+        )?;
 
         let bs = op.read("etc/os-release").await?;
         assert_eq!(bs.to_vec(), b"NAME=OpenDAL\n");
@@ -551,8 +602,7 @@ mod tests {
                 .layout(dir.path().to_string_lossy())
                 .reference("latest")
                 .platform(ImagePlatform::linux_amd64()),
-        )?
-        .finish();
+        )?;
 
         assert!(op.stat("deleted").await.is_err());
         Ok(())

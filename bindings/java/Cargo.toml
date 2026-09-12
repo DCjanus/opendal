@@ -24,18 +24,18 @@ edition = "2024"
 homepage = "https://opendal.apache.org/"
 license = "Apache-2.0"
 repository = "https://github.com/apache/opendal"
-rust-version = "1.85"
+rust-version = "1.91"
 
 [lib]
 crate-type = ["cdylib", "staticlib"]
 doc = false
 
 [dependencies]
-jni = { version = "0.21.1" }
+jni = { version = "0.22.4" }
 # opendal-java won't be published to crates.io, we always use the local version
 opendal = { version = ">=0", path = "../../core", default-features = false, features = [
   "blocking",
-  "reqwest-rustls-tls",
+  "http-transport-reqwest-rustls",
   "executors-tokio",
 
   # enabled layers
@@ -50,6 +50,7 @@ opendal = { version = ">=0", path = "../../core", default-features = false, feat
   "services-cos",
   "services-fs",
   "services-gcs",
+  "services-gcs-grpc",
   "services-ghac",
   "services-http",
   "services-ipmfs",
