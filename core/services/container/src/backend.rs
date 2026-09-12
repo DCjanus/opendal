@@ -133,7 +133,7 @@ pub(crate) struct ContainerBackend {
 }
 
 impl ContainerBackend {
-    fn get(&self, path: &str) -> Result<Option<ContainerEntry>> {
+    fn resolve_path(&self, path: &str) -> Result<Option<String>> {
         let Some(resolved) = self.core.resolve_path(path)? else {
             return Ok(None);
         };
@@ -145,6 +145,13 @@ impl ContainerBackend {
                 "container image link escapes the configured root",
             ));
         }
+        Ok(Some(resolved))
+    }
+
+    fn get(&self, path: &str) -> Result<Option<ContainerEntry>> {
+        let Some(resolved) = self.resolve_path(path)? else {
+            return Ok(None);
+        };
         Ok(self.core.entries.get(&resolved).cloned())
     }
 }
@@ -200,7 +207,19 @@ impl Service for ContainerBackend {
         } else {
             format!("{p}/")
         };
-        let entries = self.core.scan(&scan_path);
+        let resolved_path = self
+            .resolve_path(scan_path.trim_end_matches('/'))?
+            .map(|path| ensure_dir_path(&path))
+            .unwrap_or_else(|| scan_path.clone());
+        let entries = self
+            .core
+            .scan(&resolved_path)
+            .into_iter()
+            .map(|(key, metadata)| {
+                let suffix = key.strip_prefix(&resolved_path).unwrap_or(&key);
+                (format!("{scan_path}{suffix}"), metadata)
+            })
+            .collect();
         let lister = ContainerLister::new(self.root.clone(), entries);
         let lister = oio::HierarchyLister::new(lister, path, args.recursive());
 
@@ -728,6 +747,17 @@ fn blob_path(layout: &Path, digest: &str) -> Result<PathBuf> {
         .with_context("algorithm", algorithm.to_string()));
     }
 
+    if encoded.len() != 64
+        || !encoded
+            .bytes()
+            .all(|value| value.is_ascii_digit() || (b'a'..=b'f').contains(&value))
+    {
+        return Err(
+            Error::new(ErrorKind::ConfigInvalid, "invalid SHA-256 digest encoding")
+                .with_context("digest", digest.to_string()),
+        );
+    }
+
     Ok(layout.join("blobs").join(algorithm).join(encoded))
 }
 
@@ -855,6 +885,30 @@ mod tests {
         assert_eq!(op.read("target").await?.to_vec(), b"new");
         assert_eq!(op.read("alias").await?.to_vec(), b"new");
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn list_follows_directory_symlink() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let layer = gzip_layer(&[
+            TestEntry::file("usr/bin/tool", b"tool"),
+            TestEntry::symlink("bin", "usr/bin"),
+        ]);
+        write_layout(dir.path(), vec![layer]);
+
+        let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
+        let entries = op.list("bin/").await?;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].path(), "bin/tool");
+        Ok(())
+    }
+
+    #[test]
+    fn blob_path_rejects_invalid_sha256_digest() {
+        let layout = Path::new("layout");
+        assert!(blob_path(layout, "sha256:../../../outside").is_err());
+        assert!(blob_path(layout, &format!("sha256:{}", "A".repeat(64))).is_err());
+        assert!(blob_path(layout, &format!("sha256:{}", "a".repeat(63))).is_err());
     }
 
     #[tokio::test]
