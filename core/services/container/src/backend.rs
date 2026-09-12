@@ -522,20 +522,42 @@ fn resolve_hardlinks(entries: &mut BTreeMap<String, ContainerEntry>) -> Result<(
         return Ok(());
     }
 
-    let core = ContainerCore {
-        entries: entries.clone(),
-    };
+    let layer_state = entries.clone();
     for path in paths {
-        let entry = core.get(&path)?.ok_or_else(|| {
+        let target = match &layer_state[&path].link {
+            Some(ContainerLink::Hard(target)) => super::core::normalize_link_target("", target)?,
+            _ => unreachable!(),
+        };
+        let entry = resolve_hardlink(&layer_state, target)
+            .map_err(|err| err.with_context("path", path.clone()))?;
+        entries.insert(path, entry);
+    }
+    Ok(())
+}
+
+fn resolve_hardlink(
+    entries: &BTreeMap<String, ContainerEntry>,
+    mut target: String,
+) -> Result<ContainerEntry> {
+    for _ in 0..=entries.len() {
+        let entry = entries.get(&target).ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
                 "OCI layer hard link target is not found",
             )
-            .with_context("path", path.clone())
         })?;
-        entries.insert(path, entry);
+        match &entry.link {
+            Some(ContainerLink::Hard(next)) => {
+                target = super::core::normalize_link_target("", next)?;
+            }
+            _ => return Ok(entry.clone()),
+        }
     }
-    Ok(())
+
+    Err(Error::new(
+        ErrorKind::Unexpected,
+        "OCI layer hard link target contains a cycle",
+    ))
 }
 
 fn is_whiteout(path: &str) -> bool {
@@ -548,7 +570,7 @@ fn apply_whiteout(path: &str, entries: &mut BTreeMap<String, ContainerEntry>) ->
         if parent.is_empty() {
             entries.clear();
         } else {
-            remove_prefix(entries, &ensure_dir_path(parent));
+            remove_children(entries, &ensure_dir_path(parent));
         }
         return Ok(());
     }
@@ -565,6 +587,17 @@ fn apply_whiteout(path: &str, entries: &mut BTreeMap<String, ContainerEntry>) ->
         remove_prefix(entries, &ensure_dir_path(&target));
     }
     Ok(())
+}
+
+fn remove_children(entries: &mut BTreeMap<String, ContainerEntry>, directory: &str) {
+    let keys = entries
+        .keys()
+        .filter(|key| key.starts_with(directory) && key.as_str() != directory)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in keys {
+        entries.remove(&key);
+    }
 }
 
 fn replace_entry(
@@ -773,6 +806,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opaque_whiteout_keeps_parent_directory() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = gzip_layer(&[TestEntry::file("dir/old", b"old")]);
+        let upper = gzip_layer(&[TestEntry::file("dir/.wh..wh..opq", b"")]);
+        write_layout(dir.path(), vec![lower, upper]);
+
+        let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
+        assert!(op.stat("dir").await?.is_dir());
+        assert!(op.list("dir/").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn directory_is_replaced_by_file() -> Result<()> {
         let dir = tempfile::tempdir().unwrap();
         let lower = gzip_layer(&[TestEntry::file("foo/bar", b"lower")]);
@@ -793,13 +839,21 @@ mod tests {
             TestEntry::file("usr/bin/dash", b"shell"),
             TestEntry::symlink("bin/sh", "../usr/bin/dash"),
             TestEntry::hardlink("usr/bin/dash-copy", "usr/bin/dash"),
+            TestEntry::file("real", b"old"),
+            TestEntry::symlink("target", "real"),
+            TestEntry::hardlink("alias", "target"),
         ]);
-        let upper = gzip_layer(&[TestEntry::file("usr/bin/dash", b"new-shell")]);
+        let upper = gzip_layer(&[
+            TestEntry::file("usr/bin/dash", b"new-shell"),
+            TestEntry::file("real", b"new"),
+        ]);
         write_layout(dir.path(), vec![lower, upper]);
 
         let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
         assert_eq!(op.read("bin/sh").await?.to_vec(), b"new-shell");
         assert_eq!(op.read("usr/bin/dash-copy").await?.to_vec(), b"shell");
+        assert_eq!(op.read("target").await?.to_vec(), b"new");
+        assert_eq!(op.read("alias").await?.to_vec(), b"new");
         Ok(())
     }
 

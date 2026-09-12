@@ -39,13 +39,6 @@ pub(crate) struct ContainerCore {
 }
 
 impl ContainerCore {
-    pub(crate) fn get(&self, path: &str) -> Result<Option<ContainerEntry>> {
-        let Some(path) = self.resolve_path(path)? else {
-            return Ok(None);
-        };
-        Ok(self.entries.get(&path).cloned())
-    }
-
     pub(crate) fn has_children(&self, path: &str) -> bool {
         self.entries.keys().any(|key| key.starts_with(path))
     }
@@ -117,7 +110,7 @@ impl ContainerCore {
     }
 }
 
-fn normalize_link_target(parent: &str, target: &str) -> Result<String> {
+pub(crate) fn normalize_link_target(parent: &str, target: &str) -> Result<String> {
     let mut components = if target.starts_with('/') || parent.is_empty() {
         Vec::new()
     } else {
