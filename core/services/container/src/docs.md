@@ -18,6 +18,11 @@ This service currently supports local OCI image layouts only. It resolves a
 single image reference and exposes the merged rootfs as a read-only OpenDAL
 operator.
 
+The service supports uncompressed tar and gzip-compressed tar layers. It
+applies OCI whiteouts and filesystem replacement rules while merging layers,
+and resolves symbolic and hard links within the image rootfs for `stat` and
+`read` operations.
+
 The initial implementation builds an in-memory index from layer tar archives
 while the operator is being created. Remote registries, Docker daemon storage,
 Podman or containerd storage, OCI archives, Docker archives, per-layer access,

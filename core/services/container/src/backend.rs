@@ -36,6 +36,7 @@ use super::config::ImagePlatform;
 use super::config::OciPlatform;
 use super::core::ContainerCore;
 use super::core::ContainerEntry;
+use super::core::ContainerLink;
 use super::lister::ContainerLister;
 
 const OCI_REF_NAME: &str = "org.opencontainers.image.ref.name";
@@ -131,6 +132,23 @@ pub(crate) struct ContainerBackend {
     capability: Capability,
 }
 
+impl ContainerBackend {
+    fn get(&self, path: &str) -> Result<Option<ContainerEntry>> {
+        let Some(resolved) = self.core.resolve_path(path)? else {
+            return Ok(None);
+        };
+        let root = self.root.trim_start_matches('/');
+        if !root.is_empty() && resolved != root.trim_end_matches('/') && !resolved.starts_with(root)
+        {
+            return Err(Error::new(
+                ErrorKind::PermissionDenied,
+                "container image link escapes the configured root",
+            ));
+        }
+        Ok(self.core.entries.get(&resolved).cloned())
+    }
+}
+
 impl Service for ContainerBackend {
     type Reader = oio::StreamReader<ContainerReader>;
     type Writer = ();
@@ -153,7 +171,7 @@ impl Service for ContainerBackend {
             return Ok(RpStat::new(MetadataBuilder::dir().build()));
         }
 
-        if let Some(entry) = self.core.get(&p) {
+        if let Some(entry) = self.get(&p)? {
             return Ok(RpStat::new(entry.metadata));
         }
 
@@ -234,7 +252,7 @@ pub struct ContainerReader {
 impl oio::StreamRead for ContainerReader {
     async fn open(&self, range: BytesRange) -> Result<(RpRead, Box<dyn oio::ReadStreamDyn>)> {
         let path = build_abs_path(&self.backend.root, &self.path);
-        let entry = self.backend.core.get(&path).ok_or_else(|| {
+        let entry = self.backend.get(&path)?.ok_or_else(|| {
             Error::new(ErrorKind::NotFound, "path is not found in container image")
         })?;
         let content = entry.content.ok_or_else(|| {
@@ -264,7 +282,16 @@ struct OciIndex {
 
 #[derive(Debug, Deserialize)]
 struct OciManifest {
+    config: Descriptor,
     layers: Vec<Descriptor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OciImageConfig {
+    architecture: String,
+    os: String,
+    #[serde(default)]
+    variant: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -280,24 +307,36 @@ struct Descriptor {
 
 fn load_layout(layout: &Path, reference: &str, platform: &ImagePlatform) -> Result<ContainerCore> {
     let index: OciIndex = read_json(&layout.join("index.json"))?;
-    let descriptor = index
+    let descriptors = index
         .manifests
         .iter()
-        .find(|descriptor| {
+        .filter(|descriptor| {
             descriptor
                 .annotations
                 .get(OCI_REF_NAME)
                 .is_some_and(|value| value == reference)
                 || descriptor.digest == reference
         })
+        .collect::<Vec<_>>();
+    if descriptors.is_empty() {
+        return Err(Error::new(
+            ErrorKind::ConfigInvalid,
+            "reference is not found in OCI image layout",
+        )
+        .with_context("reference", reference.to_string()));
+    }
+    let manifest = descriptors
+        .into_iter()
+        .find_map(|descriptor| resolve_manifest(layout, descriptor, platform).transpose())
+        .transpose()?
         .ok_or_else(|| {
             Error::new(
                 ErrorKind::ConfigInvalid,
-                "reference is not found in OCI image layout",
+                "platform is not found for reference in OCI image layout",
             )
             .with_context("reference", reference.to_string())
+            .with_context("platform", platform.to_string())
         })?;
-    let manifest = resolve_manifest(layout, descriptor, platform)?;
     let mut entries = BTreeMap::new();
 
     for layer in manifest.layers {
@@ -311,28 +350,40 @@ fn resolve_manifest(
     layout: &Path,
     descriptor: &Descriptor,
     platform: &ImagePlatform,
-) -> Result<OciManifest> {
+) -> Result<Option<OciManifest>> {
+    if descriptor
+        .platform
+        .as_ref()
+        .is_some_and(|value| !platform.matches(value))
+    {
+        return Ok(None);
+    }
+
     match descriptor.media_type.as_str() {
-        OCI_IMAGE_MANIFEST | DOCKER_MANIFEST => read_json(&blob_path(layout, &descriptor.digest)?),
+        OCI_IMAGE_MANIFEST | DOCKER_MANIFEST => {
+            let manifest: OciManifest = read_json(&blob_path(layout, &descriptor.digest)?)?;
+            if descriptor.platform.is_none() {
+                let config: OciImageConfig =
+                    read_json(&blob_path(layout, &manifest.config.digest)?)?;
+                let config_platform = OciPlatform {
+                    architecture: config.architecture,
+                    os: config.os,
+                    variant: config.variant,
+                };
+                if !platform.matches(&config_platform) {
+                    return Ok(None);
+                }
+            }
+            Ok(Some(manifest))
+        }
         OCI_IMAGE_INDEX | DOCKER_MANIFEST_LIST => {
             let index: OciIndex = read_json(&blob_path(layout, &descriptor.digest)?)?;
-            let descriptor = index
-                .manifests
-                .iter()
-                .find(|descriptor| {
-                    descriptor
-                        .platform
-                        .as_ref()
-                        .is_some_and(|p| platform.matches(p))
-                })
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::ConfigInvalid,
-                        "platform is not found in OCI image index",
-                    )
-                    .with_context("platform", platform.to_string())
-                })?;
-            read_json(&blob_path(layout, &descriptor.digest)?)
+            for descriptor in &index.manifests {
+                if let Some(manifest) = resolve_manifest(layout, descriptor, platform)? {
+                    return Ok(Some(manifest));
+                }
+            }
+            Ok(None)
         }
         _ => Err(Error::new(
             ErrorKind::Unsupported,
@@ -378,6 +429,9 @@ fn apply_tar_layer<R: Read>(
         .set_source(err)
     })?;
 
+    let mut whiteouts = Vec::new();
+    let mut layer_entries = Vec::new();
+
     for entry in archive_entries {
         let mut entry = entry.map_err(|err| {
             Error::new(ErrorKind::Unexpected, "failed to read OCI layer tar entry").set_source(err)
@@ -390,20 +444,21 @@ fn apply_tar_layer<R: Read>(
             continue;
         }
 
-        if apply_whiteout(&path, entries) {
+        if is_whiteout(&path) {
+            whiteouts.push(path);
             continue;
         }
 
         if entry.header().entry_type().is_dir() {
             let path = ensure_dir_path(&path);
-            insert_parent_dirs(&path, entries);
-            entries.insert(
+            layer_entries.push((
                 path,
                 ContainerEntry {
                     metadata: MetadataBuilder::dir().build(),
                     content: None,
+                    link: None,
                 },
-            );
+            ));
             continue;
         }
 
@@ -416,32 +471,78 @@ fn apply_tar_layer<R: Read>(
                 )
                 .set_source(err)
             })?;
-            insert_parent_dirs(&path, entries);
             let content = Bytes::from(content);
-            entries.insert(
+            layer_entries.push((
                 path,
                 ContainerEntry {
                     metadata: MetadataBuilder::file(content.len() as u64).build(),
                     content: Some(content),
+                    link: None,
                 },
-            );
+            ));
             continue;
         }
 
-        insert_parent_dirs(&path, entries);
-        entries.insert(
+        let link = if entry.header().entry_type().is_symlink() {
+            Some(ContainerLink::Symbolic(read_link_name(&entry)?))
+        } else if entry.header().entry_type().is_hard_link() {
+            Some(ContainerLink::Hard(read_link_name(&entry)?))
+        } else {
+            None
+        };
+        layer_entries.push((
             path,
             ContainerEntry {
                 metadata: MetadataBuilder::unknown().build(),
                 content: None,
+                link,
             },
-        );
+        ));
     }
+
+    for path in whiteouts {
+        apply_whiteout(&path, entries)?;
+    }
+    for (path, entry) in layer_entries {
+        replace_entry(entries, path, entry);
+    }
+    resolve_hardlinks(entries)?;
 
     Ok(())
 }
 
-fn apply_whiteout(path: &str, entries: &mut BTreeMap<String, ContainerEntry>) -> bool {
+fn resolve_hardlinks(entries: &mut BTreeMap<String, ContainerEntry>) -> Result<()> {
+    let paths = entries
+        .iter()
+        .filter_map(|(path, entry)| {
+            matches!(entry.link, Some(ContainerLink::Hard(_))).then_some(path.clone())
+        })
+        .collect::<Vec<_>>();
+    if paths.is_empty() {
+        return Ok(());
+    }
+
+    let core = ContainerCore {
+        entries: entries.clone(),
+    };
+    for path in paths {
+        let entry = core.get(&path)?.ok_or_else(|| {
+            Error::new(
+                ErrorKind::Unexpected,
+                "OCI layer hard link target is not found",
+            )
+            .with_context("path", path.clone())
+        })?;
+        entries.insert(path, entry);
+    }
+    Ok(())
+}
+
+fn is_whiteout(path: &str) -> bool {
+    split_parent_name(path).1.starts_with(".wh.")
+}
+
+fn apply_whiteout(path: &str, entries: &mut BTreeMap<String, ContainerEntry>) -> Result<()> {
     let (parent, name) = split_parent_name(path);
     if name == ".wh..wh..opq" {
         if parent.is_empty() {
@@ -449,17 +550,56 @@ fn apply_whiteout(path: &str, entries: &mut BTreeMap<String, ContainerEntry>) ->
         } else {
             remove_prefix(entries, &ensure_dir_path(parent));
         }
-        return true;
+        return Ok(());
     }
 
     if let Some(target) = name.strip_prefix(".wh.") {
+        if target.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                "OCI layer contains an invalid whiteout",
+            ));
+        }
         let target = join_path(parent, target);
         entries.remove(&target);
         remove_prefix(entries, &ensure_dir_path(&target));
-        return true;
     }
+    Ok(())
+}
 
-    false
+fn replace_entry(
+    entries: &mut BTreeMap<String, ContainerEntry>,
+    path: String,
+    entry: ContainerEntry,
+) {
+    let is_dir = path.ends_with('/');
+    let plain_path = path.trim_end_matches('/');
+
+    if is_dir {
+        entries.remove(plain_path);
+    } else {
+        entries.remove(&ensure_dir_path(&path));
+        remove_prefix(entries, &ensure_dir_path(&path));
+    }
+    insert_parent_dirs(&path, entries);
+    entries.insert(path, entry);
+}
+
+fn read_link_name<R: Read>(entry: &tar::Entry<'_, R>) -> Result<String> {
+    let target = entry.link_name().map_err(|err| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "failed to read OCI layer link target",
+        )
+        .set_source(err)
+    })?;
+    let target = target.ok_or_else(|| {
+        Error::new(
+            ErrorKind::Unexpected,
+            "OCI layer link entry does not have a target",
+        )
+    })?;
+    Ok(target.to_string_lossy().into_owned())
 }
 
 fn remove_prefix(entries: &mut BTreeMap<String, ContainerEntry>, prefix: &str) {
@@ -483,11 +623,13 @@ fn insert_parent_dirs(path: &str, entries: &mut BTreeMap<String, ContainerEntry>
 
         current.push_str(part);
         current.push('/');
+        entries.remove(current.trim_end_matches('/'));
         entries
             .entry(current.clone())
             .or_insert_with(|| ContainerEntry {
                 metadata: MetadataBuilder::dir().build(),
                 content: None,
+                link: None,
             });
     }
 }
@@ -608,14 +750,86 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn whiteouts_do_not_hide_same_layer_entries() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = gzip_layer(&[
+            TestEntry::file("foo", b"old"),
+            TestEntry::file("dir/old", b"old"),
+        ]);
+        let upper = gzip_layer(&[
+            TestEntry::file("foo", b"new"),
+            TestEntry::file(".wh.foo", b""),
+            TestEntry::file("dir/new", b"new"),
+            TestEntry::file("dir/.wh..wh..opq", b""),
+        ]);
+        write_layout(dir.path(), vec![lower, upper]);
+
+        let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
+        assert_eq!(op.read("foo").await?.to_vec(), b"new");
+        assert_eq!(op.read("dir/new").await?.to_vec(), b"new");
+        assert!(op.stat("dir/old").await.is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn directory_is_replaced_by_file() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = gzip_layer(&[TestEntry::file("foo/bar", b"lower")]);
+        let upper = gzip_layer(&[TestEntry::file("foo", b"upper")]);
+        write_layout(dir.path(), vec![lower, upper]);
+
+        let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
+        assert_eq!(op.read("foo").await?.to_vec(), b"upper");
+        assert!(op.stat("foo/bar").await.is_err());
+        assert!(op.list("foo/").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn symlink_and_hardlink_are_readable() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = gzip_layer(&[
+            TestEntry::file("usr/bin/dash", b"shell"),
+            TestEntry::symlink("bin/sh", "../usr/bin/dash"),
+            TestEntry::hardlink("usr/bin/dash-copy", "usr/bin/dash"),
+        ]);
+        let upper = gzip_layer(&[TestEntry::file("usr/bin/dash", b"new-shell")]);
+        write_layout(dir.path(), vec![lower, upper]);
+
+        let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
+        assert_eq!(op.read("bin/sh").await?.to_vec(), b"new-shell");
+        assert_eq!(op.read("usr/bin/dash-copy").await?.to_vec(), b"shell");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn platform_filters_top_level_manifest_descriptors() -> Result<()> {
+        let dir = tempfile::tempdir().unwrap();
+        write_multi_platform_layout(dir.path());
+
+        let op = operator(dir.path(), "latest", ImagePlatform::linux_amd64())?;
+        assert_eq!(op.read("platform").await?.to_vec(), b"amd64");
+        Ok(())
+    }
+
+    fn operator(path: &Path, reference: &str, platform: ImagePlatform) -> Result<Operator> {
+        Operator::new(
+            ContainerBuilder::default()
+                .layout(path.to_string_lossy())
+                .reference(reference)
+                .platform(platform),
+        )
+    }
+
     fn create_layout(path: &Path) {
-        let layer = gzip_layer(&[("etc/os-release", b"NAME=OpenDAL\n".as_slice())]);
+        let layer = gzip_layer(&[TestEntry::file("etc/os-release", b"NAME=OpenDAL\n")]);
         write_layout(path, vec![layer]);
     }
 
     fn create_layout_with_whiteout(path: &Path) {
-        let lower = gzip_layer(&[("deleted", b"deleted".as_slice())]);
-        let upper = gzip_layer(&[(".wh.deleted", b"".as_slice())]);
+        let lower = gzip_layer(&[TestEntry::file("deleted", b"deleted")]);
+        let upper = gzip_layer(&[TestEntry::file(".wh.deleted", b"")]);
         write_layout(path, vec![lower, upper]);
     }
 
@@ -667,16 +881,84 @@ mod tests {
         fs::write(path.join("index.json"), index).unwrap();
     }
 
-    fn gzip_layer(files: &[(&str, &[u8])]) -> Vec<u8> {
+    fn write_multi_platform_layout(path: &Path) {
+        fs::create_dir_all(path.join("blobs/sha256")).unwrap();
+        fs::write(path.join("oci-layout"), r#"{"imageLayoutVersion":"1.0.0"}"#).unwrap();
+
+        let manifests = [("arm64", b"arm64".as_slice()), ("amd64", b"amd64".as_slice())]
+            .map(|(architecture, content)| {
+                let layer = gzip_layer(&[TestEntry::file("platform", content)]);
+                let layer_digest = write_blob(path, &layer);
+                let config = serde_json::json!({"architecture": architecture, "os": "linux"})
+                    .to_string();
+                let config_digest = write_blob(path, config.as_bytes());
+                let manifest = serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": OCI_IMAGE_MANIFEST,
+                    "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config.len()},
+                    "layers": [{"mediaType": OCI_LAYER_TAR_GZIP, "digest": layer_digest, "size": layer.len()}],
+                })
+                .to_string();
+                let digest = write_blob(path, manifest.as_bytes());
+                serde_json::json!({
+                    "mediaType": OCI_IMAGE_MANIFEST,
+                    "digest": digest,
+                    "size": manifest.len(),
+                    "annotations": {(OCI_REF_NAME): "latest"},
+                    "platform": {"architecture": architecture, "os": "linux"},
+                })
+            });
+
+        fs::write(
+            path.join("index.json"),
+            serde_json::json!({"schemaVersion": 2, "manifests": manifests}).to_string(),
+        )
+        .unwrap();
+    }
+
+    enum TestEntry<'a> {
+        File(&'a str, &'a [u8]),
+        Symlink(&'a str, &'a str),
+        Hardlink(&'a str, &'a str),
+    }
+
+    impl<'a> TestEntry<'a> {
+        fn file(path: &'a str, content: &'a [u8]) -> Self {
+            Self::File(path, content)
+        }
+
+        fn symlink(path: &'a str, target: &'a str) -> Self {
+            Self::Symlink(path, target)
+        }
+
+        fn hardlink(path: &'a str, target: &'a str) -> Self {
+            Self::Hardlink(path, target)
+        }
+    }
+
+    fn gzip_layer(entries: &[TestEntry<'_>]) -> Vec<u8> {
         let mut tar = Vec::new();
         {
             let mut builder = TarBuilder::new(&mut tar);
-            for (path, content) in files {
+            for entry in entries {
                 let mut header = Header::new_gnu();
+                let (path, content) = match entry {
+                    TestEntry::File(path, content) => (*path, *content),
+                    TestEntry::Symlink(path, target) => {
+                        header.set_entry_type(tar::EntryType::Symlink);
+                        header.set_link_name(target).unwrap();
+                        (*path, b"".as_slice())
+                    }
+                    TestEntry::Hardlink(path, target) => {
+                        header.set_entry_type(tar::EntryType::Link);
+                        header.set_link_name(target).unwrap();
+                        (*path, b"".as_slice())
+                    }
+                };
                 header.set_path(path).unwrap();
                 header.set_size(content.len() as u64);
                 header.set_cksum();
-                builder.append(&header, *content).unwrap();
+                builder.append(&header, content).unwrap();
             }
             builder.finish().unwrap();
         }
