@@ -67,7 +67,16 @@ impl ImagePlatform {
     pub(crate) fn matches(&self, platform: &OciPlatform) -> bool {
         self.os == platform.os
             && self.architecture == platform.architecture
-            && self.variant.as_deref() == platform.variant.as_deref()
+            && normalized_variant(&self.architecture, self.variant.as_deref())
+                == normalized_variant(&platform.architecture, platform.variant.as_deref())
+    }
+}
+
+fn normalized_variant<'a>(architecture: &str, variant: Option<&'a str>) -> &'a str {
+    match (architecture, variant.unwrap_or_default()) {
+        ("amd64", "v1") | ("arm64", "8" | "v8" | "v8.0") => "",
+        ("arm", "" | "7" | "v7") => "v7",
+        (_, variant) => variant,
     }
 }
 
@@ -158,5 +167,39 @@ impl Configurator for ContainerConfig {
 
     fn into_builder(self) -> Self::Builder {
         ContainerBuilder { config: self }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn platform_matches_default_variants() {
+        assert!(ImagePlatform::linux_arm64().matches(&OciPlatform {
+            os: "linux".to_string(),
+            architecture: "arm64".to_string(),
+            variant: Some("v8".to_string()),
+        }));
+        assert!(ImagePlatform::linux_amd64().matches(&OciPlatform {
+            os: "linux".to_string(),
+            architecture: "amd64".to_string(),
+            variant: Some("v1".to_string()),
+        }));
+        assert!(ImagePlatform::new("linux", "arm").matches(&OciPlatform {
+            os: "linux".to_string(),
+            architecture: "arm".to_string(),
+            variant: Some("v7".to_string()),
+        }));
+
+        assert!(
+            !ImagePlatform::new("linux", "arm")
+                .with_variant("v6")
+                .matches(&OciPlatform {
+                    os: "linux".to_string(),
+                    architecture: "arm".to_string(),
+                    variant: Some("v7".to_string()),
+                })
+        );
     }
 }
